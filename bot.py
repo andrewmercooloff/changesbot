@@ -73,7 +73,7 @@ async def fetch_page_content(url: str) -> Optional[str]:
                 'User-Agent': user_agent,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                 'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Encoding': 'gzip, deflate',  # Убрали br, чтобы избежать ошибок, если brotli не установлен
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
@@ -119,7 +119,32 @@ async def fetch_page_content(url: str) -> Optional[str]:
                     ssl=False  # Некоторые сайты требуют отключения проверки SSL
                 ) as response:
                     if response.status == 200:
-                        content = await response.text()
+                        try:
+                            content = await response.text()
+                        except Exception as decode_error:
+                            # Если ошибка декодирования (например, Brotli не установлен)
+                            if 'brotli' in str(decode_error).lower() or 'br' in str(decode_error).lower():
+                                logger.warning(f"Ошибка декодирования Brotli для {url}, пробуем без br...")
+                                # Пробуем без brotli в заголовках
+                                headers_no_br = headers.copy()
+                                headers_no_br['Accept-Encoding'] = 'gzip, deflate'
+                                # Создаем новую сессию без br
+                                async with aiohttp.ClientSession(
+                                    headers=headers_no_br,
+                                    timeout=timeout,
+                                    connector=connector,
+                                    cookie_jar=cookie_jar
+                                ) as session2:
+                                    await asyncio.sleep(1)
+                                    async with session2.get(url, allow_redirects=True, ssl=False) as response2:
+                                        if response2.status == 200:
+                                            content = await response2.text()
+                                        else:
+                                            if attempt < len(user_agents):
+                                                continue
+                                            return None
+                            else:
+                                raise decode_error
                         # Проверяем, не получили ли мы страницу с защитой от ботов
                         content_lower = content.lower()
                         if any(indicator in content_lower for indicator in [
