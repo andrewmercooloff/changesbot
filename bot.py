@@ -2,11 +2,13 @@ import os
 import asyncio
 import hashlib
 import logging
+import uuid
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+from dataclasses import dataclass, asdict
 import aiohttp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -19,11 +21,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class Project:
+    """Класс для хранения информации о проекте отслеживания"""
+    project_id: str
+    url: str
+    name: str
+    last_hash: Optional[str] = None
+    last_check: Optional[str] = None
+    interval_minutes: int = 60  # Периодичность проверки в минутах
+    is_active: bool = True
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 # Глобальные переменные для хранения состояния
-# Ключ - chat_id, значение - словарь с url и последним хешем
-user_data: Dict[int, Dict[str, str]] = {}
-# Флаг для отслеживания активных задач проверки
-monitoring_tasks: Dict[int, asyncio.Task] = {}
+# Ключ - chat_id, значение - список проектов
+user_projects: Dict[int, Dict[str, Project]] = {}
+# Ключ - (chat_id, project_id), значение - задача мониторинга
+monitoring_tasks: Dict[tuple, asyncio.Task] = {}
 
 
 async def fetch_page_content(url: str) -> Optional[str]:
@@ -81,109 +103,350 @@ def calculate_hash(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 
-async def check_page_changes(chat_id: int, url: str, context: ContextTypes.DEFAULT_TYPE):
+def format_interval(minutes: int) -> str:
+    """Форматирует интервал в читаемый вид"""
+    if minutes < 60:
+        return f"{minutes} мин"
+    elif minutes < 1440:
+        hours = minutes // 60
+        return f"{hours} ч"
+    else:
+        days = minutes // 1440
+        return f"{days} дн"
+
+
+async def check_page_changes(chat_id: int, project: Project, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет изменения на странице и отправляет уведомление при изменении"""
-    content = await fetch_page_content(url)
+    content = await fetch_page_content(project.url)
     
     if content is None:
-        # Проверяем, не является ли это проблемой с защитой от ботов
+        # Обновляем время последней проверки даже при ошибке
+        project.last_check = datetime.now().isoformat()
+        user_projects[chat_id][project.project_id] = project
+        
         error_message = (
-            f"⚠️ Проблема при проверке страницы\n\n"
-            f"🔗 Страница: {url}\n\n"
+            f"⚠️ Проблема при проверке проекта\n\n"
+            f"📌 Проект: {project.name}\n"
+            f"🔗 Страница: {project.url}\n\n"
             f"❌ Не удалось получить содержимое страницы.\n"
             f"Возможные причины:\n"
             f"• Страница использует защиту от ботов (Cloudflare, reCAPTCHA и т.д.)\n"
             f"• Страница временно недоступна\n"
-            f"• Проблемы с интернет-соединением\n"
-            f"• Страница требует авторизации\n\n"
-            f"💡 Бот использует заголовки браузера для обхода защиты,\n"
-            f"но некоторые сайты требуют более сложных методов.\n\n"
-            f"🔄 Я попробую снова при следующей проверке (через 1 час)"
+            f"• Проблемы с интернет-соединением\n\n"
+            f"🔄 Следующая проверка через {format_interval(project.interval_minutes)}"
         )
         await context.bot.send_message(chat_id=chat_id, text=error_message)
         return
     
     current_hash = calculate_hash(content)
-    user_info = user_data.get(chat_id, {})
-    last_hash = user_info.get('last_hash')
     
-    if last_hash is None:
+    if project.last_hash is None:
         # Первая проверка - сохраняем хеш
-        user_data[chat_id] = {
-            'url': url,
-            'last_hash': current_hash,
-            'last_check': datetime.now().isoformat()
-        }
+        project.last_hash = current_hash
+        project.last_check = datetime.now().isoformat()
+        user_projects[chat_id][project.project_id] = project
+        
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"✅ Отслеживание успешно начато!\n\n"
-                f"🔗 Отслеживаемая страница:\n{url}\n\n"
+                f"📌 Проект: {project.name}\n"
+                f"🔗 Страница: {project.url}\n\n"
                 f"✅ Первая проверка выполнена успешно\n"
                 f"📊 Страница сохранена как эталон\n\n"
-                f"⏰ Следующая проверка будет через 1 час\n"
-                f"🔔 Я отправлю уведомление, если обнаружу изменения на странице"
+                f"⏰ Периодичность проверки: {format_interval(project.interval_minutes)}\n"
+                f"🔔 Я отправлю уведомление, если обнаружу изменения"
             )
         )
-    elif current_hash != last_hash:
+    elif current_hash != project.last_hash:
         # Страница изменилась!
-        user_data[chat_id]['last_hash'] = current_hash
-        user_data[chat_id]['last_check'] = datetime.now().isoformat()
+        project.last_hash = current_hash
+        project.last_check = datetime.now().isoformat()
+        user_projects[chat_id][project.project_id] = project
         
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"🔔 ВНИМАНИЕ! Обнаружены изменения!\n\n"
-                f"🔗 Страница: {url}\n\n"
+                f"📌 Проект: {project.name}\n"
+                f"🔗 Страница: {project.url}\n\n"
                 f"⏰ Время обнаружения: {datetime.now().strftime('%d.%m.%Y в %H:%M:%S')}\n\n"
                 f"📝 Страница была изменена. Проверьте её содержимое!"
             )
         )
-        logger.info(f"Изменения обнаружены для пользователя {chat_id} на странице {url}")
+        logger.info(f"Изменения обнаружены для проекта {project.project_id} пользователя {chat_id}")
     else:
         # Изменений нет
-        user_data[chat_id]['last_check'] = datetime.now().isoformat()
-        logger.debug(f"Изменений не обнаружено для пользователя {chat_id}")
+        project.last_check = datetime.now().isoformat()
+        user_projects[chat_id][project.project_id] = project
+        logger.debug(f"Изменений не обнаружено для проекта {project.project_id}")
 
 
-async def monitoring_loop(chat_id: int, url: str, context: ContextTypes.DEFAULT_TYPE):
+async def monitoring_loop(chat_id: int, project: Project, context: ContextTypes.DEFAULT_TYPE):
     """Основной цикл мониторинга страницы"""
-    while chat_id in user_data:
+    task_key = (chat_id, project.project_id)
+    
+    while (chat_id in user_projects and 
+           project.project_id in user_projects[chat_id] and 
+           user_projects[chat_id][project.project_id].is_active):
         try:
-            await check_page_changes(chat_id, url, context)
-            # Ждем 1 час (3600 секунд) перед следующей проверкой
-            await asyncio.sleep(3600)
+            # Получаем актуальную версию проекта (на случай изменения настроек)
+            current_project = user_projects[chat_id][project.project_id]
+            await check_page_changes(chat_id, current_project, context)
+            
+            # Ждем указанный интервал
+            await asyncio.sleep(current_project.interval_minutes * 60)
         except asyncio.CancelledError:
-            logger.info(f"Мониторинг остановлен для пользователя {chat_id}")
+            logger.info(f"Мониторинг остановлен для проекта {project.project_id} пользователя {chat_id}")
             break
         except Exception as e:
-            logger.error(f"Ошибка в цикле мониторинга для пользователя {chat_id}: {e}")
+            logger.error(f"Ошибка в цикле мониторинга для проекта {project.project_id}: {e}")
             await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+    
+    # Удаляем задачу из словаря
+    if task_key in monitoring_tasks:
+        del monitoring_tasks[task_key]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     chat_id = update.effective_chat.id
     
+    # Инициализируем список проектов для пользователя, если его еще нет
+    if chat_id not in user_projects:
+        user_projects[chat_id] = {}
+    
     welcome_message = (
         "👋 Привет! Я бот для отслеживания изменений на веб-страницах.\n\n"
-        "📋 Как это работает:\n"
-        "1️⃣ Отправьте мне ссылку на страницу, которую хотите отслеживать\n"
-        "2️⃣ Я сохраню ссылку и начну проверять её каждый час\n"
-        "3️⃣ Когда на странице что-то изменится, я сразу отправлю вам уведомление\n\n"
-        "📝 Что нужно сделать сейчас:\n"
-        "Просто отправьте мне ссылку на страницу (например: https://example.com)\n\n"
+        "📋 Возможности:\n"
+        "• Отслеживание нескольких страниц одновременно\n"
+        "• Настройка периодичности проверки для каждого проекта\n"
+        "• Управление проектами через удобное меню\n\n"
         "📌 Доступные команды:\n"
-        "/start - показать это сообщение\n"
-        "/stop - остановить отслеживание текущей страницы\n"
-        "/status - узнать статус отслеживания"
+        "/list - показать все проекты\n"
+        "/add <ссылка> - добавить новый проект\n"
+        "/delete <номер> - удалить проект\n"
+        "/interval <номер> <минуты> - изменить периодичность\n"
+        "/status <номер> - статус проекта\n"
+        "/menu - открыть меню управления\n\n"
+        "💡 Просто отправьте ссылку, чтобы быстро добавить проект!"
     )
     
     await update.message.reply_text(welcome_message)
+    await show_projects_menu(update, context)
+
+
+async def show_projects_menu(update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None):
+    """Показывает меню со списком всех проектов"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in user_projects or not user_projects[chat_id]:
+        keyboard = [[InlineKeyboardButton("➕ Добавить проект", callback_data="add_project")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        text = "📋 У вас пока нет активных проектов.\n\nНажмите кнопку ниже, чтобы добавить первый проект."
+        
+        if update.message:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        return
+    
+    projects = user_projects[chat_id]
+    text = "📋 Ваши проекты отслеживания:\n\n"
+    
+    keyboard = []
+    for idx, (project_id, project) in enumerate(projects.items(), 1):
+        status_icon = "✅" if project.is_active else "⏸"
+        last_check = "Ещё не проверялась"
+        if project.last_check:
+            try:
+                check_time = datetime.fromisoformat(project.last_check)
+                last_check = check_time.strftime('%d.%m %H:%M')
+            except:
+                pass
+        
+        # Обрезаем длинные URL для отображения
+        display_url = project.url[:50] + "..." if len(project.url) > 50 else project.url
+        
+        text += (
+            f"{idx}. {status_icon} {project.name}\n"
+            f"   🔗 {display_url}\n"
+            f"   ⏰ Проверка: {format_interval(project.interval_minutes)} | Последняя: {last_check}\n\n"
+        )
+        
+        # Кнопки для каждого проекта
+        keyboard.append([
+            InlineKeyboardButton(f"⚙️ {idx}", callback_data=f"project_{project_id}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{project_id}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Добавить проект", callback_data="add_project")])
+    keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_menu")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик callback-запросов от кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.from_user.id
+    data = query.data
+    
+    if data == "add_project":
+        await query.edit_message_text(
+            "➕ Добавление нового проекта\n\n"
+            "Отправьте ссылку на страницу, которую хотите отслеживать.\n\n"
+            "Пример: https://example.com"
+        )
+    elif data == "refresh_menu":
+        await show_projects_menu(update, context)
+    elif data.startswith("project_"):
+        project_id = data.split("_", 1)[1]
+        await show_project_details(chat_id, project_id, query)
+    elif data.startswith("delete_"):
+        project_id = data.split("_", 1)[1]
+        await delete_project(chat_id, project_id, query)
+    elif data.startswith("interval_"):
+        parts = data.split("_")
+        project_id = parts[1]
+        minutes = int(parts[2])
+        await set_interval(chat_id, project_id, minutes, query)
+    elif data.startswith("toggle_"):
+        project_id = data.split("_", 1)[1]
+        await toggle_project(chat_id, project_id, query)
+
+
+async def show_project_details(chat_id: int, project_id: str, query):
+    """Показывает детали проекта и кнопки управления"""
+    if chat_id not in user_projects or project_id not in user_projects[chat_id]:
+        await query.edit_message_text("❌ Проект не найден.")
+        return
+    
+    project = user_projects[chat_id][project_id]
+    
+    last_check = "Ещё не проверялась"
+    if project.last_check:
+        try:
+            check_time = datetime.fromisoformat(project.last_check)
+            last_check = check_time.strftime('%d.%m.%Y в %H:%M:%S')
+        except:
+            pass
+    
+    status_text = "✅ Активен" if project.is_active else "⏸ Остановлен"
+    
+    text = (
+        f"📌 Проект: {project.name}\n\n"
+        f"🔗 URL: {project.url}\n"
+        f"⏰ Периодичность: {format_interval(project.interval_minutes)}\n"
+        f"📊 Статус: {status_text}\n"
+        f"🕐 Последняя проверка: {last_check}\n"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("⏰ 15 мин", callback_data=f"interval_{project_id}_15"),
+            InlineKeyboardButton("⏰ 30 мин", callback_data=f"interval_{project_id}_30"),
+            InlineKeyboardButton("⏰ 1 час", callback_data=f"interval_{project_id}_60")
+        ],
+        [
+            InlineKeyboardButton("⏰ 3 часа", callback_data=f"interval_{project_id}_180"),
+            InlineKeyboardButton("⏰ 6 часов", callback_data=f"interval_{project_id}_360"),
+            InlineKeyboardButton("⏰ 12 часов", callback_data=f"interval_{project_id}_720")
+        ],
+        [
+            InlineKeyboardButton("⏰ 24 часа", callback_data=f"interval_{project_id}_1440"),
+        ],
+        [
+            InlineKeyboardButton("⏸ Остановить" if project.is_active else "▶️ Запустить", 
+                               callback_data=f"toggle_{project_id}")
+        ],
+        [
+            InlineKeyboardButton("🔙 Назад к списку", callback_data="refresh_menu")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def delete_project(chat_id: int, project_id: str, query):
+    """Удаляет проект"""
+    if chat_id not in user_projects or project_id not in user_projects[chat_id]:
+        await query.edit_message_text("❌ Проект не найден.")
+        return
+    
+    project = user_projects[chat_id][project_id]
+    
+    # Останавливаем задачу мониторинга
+    task_key = (chat_id, project_id)
+    if task_key in monitoring_tasks:
+        monitoring_tasks[task_key].cancel()
+        del monitoring_tasks[task_key]
+    
+    # Удаляем проект
+    del user_projects[chat_id][project_id]
+    
+    await query.edit_message_text(
+        f"✅ Проект '{project.name}' удалён.\n\n"
+        f"🔗 URL: {project.url}"
+    )
+    
+    # Показываем обновлённое меню через секунду
+    await asyncio.sleep(1)
+    fake_update = Update(update_id=query.update_id, callback_query=query)
+    await show_projects_menu(fake_update)
+
+
+async def set_interval(chat_id: int, project_id: str, minutes: int, query):
+    """Устанавливает интервал проверки для проекта"""
+    if chat_id not in user_projects or project_id not in user_projects[chat_id]:
+        await query.edit_message_text("❌ Проект не найден.")
+        return
+    
+    project = user_projects[chat_id][project_id]
+    project.interval_minutes = minutes
+    user_projects[chat_id][project_id] = project
+    
+    await query.answer(f"✅ Периодичность изменена на {format_interval(minutes)}")
+    await show_project_details(chat_id, project_id, query)
+
+
+async def toggle_project(chat_id: int, project_id: str, query):
+    """Включает/выключает проект"""
+    if chat_id not in user_projects or project_id not in user_projects[chat_id]:
+        await query.edit_message_text("❌ Проект не найден.")
+        return
+    
+    project = user_projects[chat_id][project_id]
+    project.is_active = not project.is_active
+    user_projects[chat_id][project_id] = project
+    
+    if project.is_active:
+        # Запускаем мониторинг
+        task = asyncio.create_task(monitoring_loop(chat_id, project, query.bot))
+        monitoring_tasks[(chat_id, project_id)] = task
+        await query.answer("✅ Проект запущен")
+    else:
+        # Останавливаем мониторинг
+        task_key = (chat_id, project_id)
+        if task_key in monitoring_tasks:
+            monitoring_tasks[task_key].cancel()
+            del monitoring_tasks[task_key]
+        await query.answer("⏸ Проект остановлен")
+    
+    await show_project_details(chat_id, project_id, query)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик сообщений с URL"""
+    """Обработчик сообщений с URL для быстрого добавления проекта"""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
     
@@ -194,100 +457,197 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, отправьте ссылку, которая начинается с:\n"
             "• http://\n"
             "• https://\n\n"
-            "Пример правильной ссылки:\n"
-            "https://example.com"
-        )
-        return
-    
-    # Останавливаем предыдущий мониторинг, если он был
-    if chat_id in monitoring_tasks:
-        monitoring_tasks[chat_id].cancel()
-        del monitoring_tasks[chat_id]
-        await update.message.reply_text(
-            "⚠️ Предыдущее отслеживание остановлено. Начинаю отслеживание новой ссылки."
-        )
-    
-    # Очищаем предыдущие данные
-    user_data[chat_id] = {
-        'url': text,
-        'last_hash': None,
-        'last_check': None
-    }
-    
-    await update.message.reply_text(
-        f"✅ Отлично! Я принял вашу ссылку:\n{text}\n\n"
-        "🔄 Что происходит сейчас:\n"
-        "• Сохраняю ссылку для отслеживания\n"
-        "• Выполняю первую проверку страницы\n"
-        "• Настраиваю автоматические проверки каждый час\n\n"
-        "⏳ Пожалуйста, подождите несколько секунд..."
-    )
-    
-    # Запускаем мониторинг
-    task = asyncio.create_task(monitoring_loop(chat_id, text, context))
-    monitoring_tasks[chat_id] = task
-    
-    # Выполняем первую проверку сразу
-    await check_page_changes(chat_id, text, context)
-
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /stop"""
-    chat_id = update.effective_chat.id
-    
-    if chat_id in monitoring_tasks:
-        monitoring_tasks[chat_id].cancel()
-        del monitoring_tasks[chat_id]
-    
-    if chat_id in user_data:
-        del user_data[chat_id]
-    
-    await update.message.reply_text(
-        "⏹ Отслеживание остановлено\n\n"
-        "✅ Все данные об отслеживании удалены\n"
-        "✅ Автоматические проверки прекращены\n\n"
-        "📝 Чтобы начать отслеживание новой страницы:\n"
-        "Отправьте мне новую ссылку на страницу, которую хотите отслеживать."
-    )
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /status"""
-    chat_id = update.effective_chat.id
-    
-    if chat_id not in user_data:
-        await update.message.reply_text(
-            "❌ Отслеживание не активно\n\n"
-            "📝 Чтобы начать отслеживание:\n"
-            "Отправьте мне ссылку на страницу, которую хотите отслеживать.\n\n"
             "Пример: https://example.com"
         )
         return
     
-    user_info = user_data[chat_id]
-    url = user_info.get('url', 'Не указано')
-    last_check = user_info.get('last_check', 'Ещё не выполнена')
+    # Инициализируем список проектов, если его еще нет
+    if chat_id not in user_projects:
+        user_projects[chat_id] = {}
     
-    # Форматируем время последней проверки для лучшей читаемости
-    if last_check and last_check != 'Ещё не выполнена':
-        try:
-            check_time = datetime.fromisoformat(last_check)
-            formatted_time = check_time.strftime('%d.%m.%Y в %H:%M:%S')
-        except:
-            formatted_time = last_check
-    else:
-        formatted_time = last_check
+    # Создаем новый проект
+    project_id = str(uuid.uuid4())[:8]
+    project_name = text.split('/')[-1] if text.split('/')[-1] else text.split('/')[-2]
+    if not project_name or len(project_name) > 50:
+        project_name = f"Проект {len(user_projects[chat_id]) + 1}"
     
-    status_message = (
-        f"📊 Текущий статус отслеживания:\n\n"
-        f"🔗 Отслеживаемая страница:\n{url}\n\n"
-        f"⏰ Последняя проверка:\n{formatted_time}\n\n"
-        f"🔄 Режим работы:\n"
-        f"Автоматическая проверка каждый час\n\n"
-        f"✅ Отслеживание активно"
+    project = Project(
+        project_id=project_id,
+        url=text,
+        name=project_name,
+        interval_minutes=60,
+        is_active=True
     )
     
-    await update.message.reply_text(status_message)
+    user_projects[chat_id][project_id] = project
+    
+    await update.message.reply_text(
+        f"✅ Проект добавлен!\n\n"
+        f"📌 Название: {project.name}\n"
+        f"🔗 URL: {text}\n"
+        f"⏰ Периодичность: {format_interval(project.interval_minutes)}\n\n"
+        f"🔄 Выполняю первую проверку..."
+    )
+    
+    # Запускаем мониторинг
+    task = asyncio.create_task(monitoring_loop(chat_id, project, context))
+    monitoring_tasks[(chat_id, project_id)] = task
+    
+    # Выполняем первую проверку сразу
+    await check_page_changes(chat_id, project, context)
+    
+    # Показываем меню
+    await show_projects_menu(update, context)
+
+
+async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /list"""
+    await show_projects_menu(update, context)
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /menu"""
+    await show_projects_menu(update, context)
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /delete <номер>"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in user_projects or not user_projects[chat_id]:
+        await update.message.reply_text("❌ У вас нет активных проектов.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите номер проекта для удаления.\n\n"
+            "Использование: /delete <номер>\n"
+            "Пример: /delete 1\n\n"
+            "Или используйте /menu для управления через кнопки."
+        )
+        return
+    
+    try:
+        project_num = int(context.args[0])
+        projects_list = list(user_projects[chat_id].items())
+        
+        if project_num < 1 or project_num > len(projects_list):
+            await update.message.reply_text(f"❌ Проект с номером {project_num} не найден.")
+            return
+        
+        project_id, project = projects_list[project_num - 1]
+        
+        # Останавливаем задачу мониторинга
+        task_key = (chat_id, project_id)
+        if task_key in monitoring_tasks:
+            monitoring_tasks[task_key].cancel()
+            del monitoring_tasks[task_key]
+        
+        # Удаляем проект
+        del user_projects[chat_id][project_id]
+        
+        await update.message.reply_text(
+            f"✅ Проект '{project.name}' удалён.\n\n"
+            f"🔗 URL: {project.url}"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Номер проекта должен быть числом.")
+
+
+async def interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /interval <номер> <минуты>"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in user_projects or not user_projects[chat_id]:
+        await update.message.reply_text("❌ У вас нет активных проектов.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Укажите номер проекта и интервал в минутах.\n\n"
+            "Использование: /interval <номер> <минуты>\n"
+            "Пример: /interval 1 30\n\n"
+            "Или используйте /menu для управления через кнопки."
+        )
+        return
+    
+    try:
+        project_num = int(context.args[0])
+        minutes = int(context.args[1])
+        
+        if minutes < 1:
+            await update.message.reply_text("❌ Интервал должен быть больше 0 минут.")
+            return
+        
+        projects_list = list(user_projects[chat_id].items())
+        
+        if project_num < 1 or project_num > len(projects_list):
+            await update.message.reply_text(f"❌ Проект с номером {project_num} не найден.")
+            return
+        
+        project_id, project = projects_list[project_num - 1]
+        project.interval_minutes = minutes
+        user_projects[chat_id][project_id] = project
+        
+        await update.message.reply_text(
+            f"✅ Периодичность проверки для проекта '{project.name}' изменена на {format_interval(minutes)}."
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Номер проекта и интервал должны быть числами.")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /status <номер>"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in user_projects or not user_projects[chat_id]:
+        await update.message.reply_text("❌ У вас нет активных проектов.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите номер проекта.\n\n"
+            "Использование: /status <номер>\n"
+            "Пример: /status 1\n\n"
+            "Или используйте /menu для просмотра всех проектов."
+        )
+        return
+    
+    try:
+        project_num = int(context.args[0])
+        projects_list = list(user_projects[chat_id].items())
+        
+        if project_num < 1 or project_num > len(projects_list):
+            await update.message.reply_text(f"❌ Проект с номером {project_num} не найден.")
+            return
+        
+        project_id, project = projects_list[project_num - 1]
+        
+        last_check = "Ещё не проверялась"
+        if project.last_check:
+            try:
+                check_time = datetime.fromisoformat(project.last_check)
+                last_check = check_time.strftime('%d.%m.%Y в %H:%M:%S')
+            except:
+                pass
+        
+        status_text = "✅ Активен" if project.is_active else "⏸ Остановлен"
+        
+        text = (
+            f"📊 Статус проекта:\n\n"
+            f"📌 Название: {project.name}\n"
+            f"🔗 URL: {project.url}\n"
+            f"⏰ Периодичность: {format_interval(project.interval_minutes)}\n"
+            f"📊 Статус: {status_text}\n"
+            f"🕐 Последняя проверка: {last_check}\n"
+        )
+        
+        await update.message.reply_text(text)
+        
+    except ValueError:
+        await update.message.reply_text("❌ Номер проекта должен быть числом.")
 
 
 def main():
@@ -306,8 +666,12 @@ def main():
     
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop))
-    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("list", list_projects))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(CommandHandler("interval", interval_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     
     # Запускаем бота
@@ -318,4 +682,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
