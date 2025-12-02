@@ -38,6 +38,8 @@ class Project:
     last_check: Optional[str] = None
     interval_minutes: int = 60  # Периодичность проверки в минутах
     is_active: bool = True
+    notify_on_no_changes: bool = False  # Отправлять уведомления при отсутствии изменений
+    last_notification: Optional[str] = None  # Время последнего уведомления
 
     def to_dict(self):
         return asdict(self)
@@ -391,6 +393,44 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
         # Изменений нет
         project.last_check = current_time.isoformat()
         user_projects[chat_id][project.project_id] = project
+        
+        # Отправляем уведомление, если включено, но не чаще раза в час
+        should_notify = False
+        if project.notify_on_no_changes:
+            if project.last_notification:
+                try:
+                    last_notif_time = datetime.fromisoformat(project.last_notification)
+                    if last_notif_time.tzinfo is None:
+                        last_notif_time = last_notif_time.replace(tzinfo=timezone.utc).astimezone(MOSCOW_TZ)
+                    else:
+                        last_notif_time = last_notif_time.astimezone(MOSCOW_TZ)
+                    
+                    # Отправляем уведомление не чаще раза в час
+                    time_since_last = (current_time - last_notif_time).total_seconds()
+                    if time_since_last >= 3600:  # 1 час
+                        should_notify = True
+                except:
+                    should_notify = True
+            else:
+                should_notify = True
+        
+        if should_notify:
+            project.last_notification = current_time.isoformat()
+            user_projects[chat_id][project.project_id] = project
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ Проверка выполнена\n\n"
+                    f"📌 Проект: {project.name}\n"
+                    f"🔗 Страница: {project.url}\n\n"
+                    f"⏰ Время проверки: {format_local_time(current_time)}\n"
+                    f"📊 Изменений не обнаружено\n\n"
+                    f"🔄 Следующая проверка через {format_interval(project.interval_minutes)}"
+                )
+            )
+            logger.info(f"Отправлено уведомление об отсутствии изменений для проекта {project.project_id}")
+        
         logger.info(f"Изменений не обнаружено для проекта {project.project_id}, следующая проверка через {format_interval(project.interval_minutes)}")
 
 
@@ -542,6 +582,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("toggle_"):
         project_id = data.split("_", 1)[1]
         await toggle_project(chat_id, project_id, query)
+    elif data.startswith("notify_"):
+        project_id = data.split("_", 1)[1]
+        await toggle_notifications(chat_id, project_id, query)
+    elif data.startswith("notify_"):
+        project_id = data.split("_", 1)[1]
+        await toggle_notifications(chat_id, project_id, query)
 
 
 async def show_project_details(chat_id: int, project_id: str, query):
@@ -587,6 +633,12 @@ async def show_project_details(chat_id: int, project_id: str, query):
         [
             InlineKeyboardButton("⏸ Остановить" if project.is_active else "▶️ Запустить", 
                                callback_data=f"toggle_{project_id}")
+        ],
+        [
+            InlineKeyboardButton(
+                "🔔 Уведомления: ВКЛ" if project.notify_on_no_changes else "🔕 Уведомления: ВЫКЛ",
+                callback_data=f"notify_{project_id}"
+            )
         ],
         [
             InlineKeyboardButton("🔙 Назад к списку", callback_data="refresh_menu")
@@ -662,6 +714,21 @@ async def toggle_project(chat_id: int, project_id: str, query):
             del monitoring_tasks[task_key]
         await query.answer("⏸ Проект остановлен")
     
+    await show_project_details(chat_id, project_id, query)
+
+
+async def toggle_notifications(chat_id: int, project_id: str, query):
+    """Включает/выключает уведомления об отсутствии изменений"""
+    if chat_id not in user_projects or project_id not in user_projects[chat_id]:
+        await query.edit_message_text("❌ Проект не найден.")
+        return
+    
+    project = user_projects[chat_id][project_id]
+    project.notify_on_no_changes = not project.notify_on_no_changes
+    user_projects[chat_id][project_id] = project
+    
+    status = "включены" if project.notify_on_no_changes else "выключены"
+    await query.answer(f"🔔 Уведомления {status}")
     await show_project_details(chat_id, project_id, query)
 
 
