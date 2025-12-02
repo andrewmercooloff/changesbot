@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
+from urllib.parse import urlparse
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -50,52 +51,121 @@ monitoring_tasks: Dict[tuple, asyncio.Task] = {}
 
 async def fetch_page_content(url: str) -> Optional[str]:
     """Получает содержимое страницы по URL с заголовками браузера для обхода защиты от ботов"""
+    # Пробуем несколько вариантов заголовков для лучшего обхода защиты
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ]
+    
+    # Извлекаем домен для Referer
     try:
-        # Заголовки реального браузера для обхода защиты от ботов
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-        }
-        
-        # Создаем сессию с заголовками и поддержкой cookies
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-        
-        async with aiohttp.ClientSession(
-            headers=headers,
-            timeout=timeout,
-            connector=connector,
-            cookie_jar=aiohttp.CookieJar()
-        ) as session:
-            # Небольшая задержка перед запросом (имитация человеческого поведения)
-            await asyncio.sleep(1)
+        parsed = urlparse(url)
+        domain = f"{parsed.scheme}://{parsed.netloc}"
+    except:
+        domain = None
+    
+    for attempt, user_agent in enumerate(user_agents, 1):
+        try:
+            # Заголовки реального браузера для обхода защиты от ботов
+            headers = {
+                'User-Agent': user_agent,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+            }
             
-            async with session.get(url, allow_redirects=True) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    return content
-                elif response.status == 403:
-                    logger.error(f"Доступ запрещен (403) для {url}. Возможно, требуется более сложный обход защиты.")
-                    return None
-                else:
-                    logger.error(f"Ошибка при получении страницы: статус {response.status}")
-                    return None
-    except aiohttp.ClientError as e:
-        logger.error(f"Ошибка сети при запросе страницы {url}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка при запросе страницы {url}: {e}")
-        return None
+            # Добавляем Referer, если можем определить домен
+            if domain:
+                headers['Referer'] = domain
+            
+            # Создаем сессию с заголовками и поддержкой cookies
+            timeout = aiohttp.ClientTimeout(total=45, connect=10)
+            connector = aiohttp.TCPConnector(
+                limit=100, 
+                limit_per_host=30,
+                ttl_dns_cache=300,
+                force_close=False
+            )
+            
+            # Создаем cookie jar для сохранения cookies между запросами
+            cookie_jar = aiohttp.CookieJar(unsafe=True)
+            
+            async with aiohttp.ClientSession(
+                headers=headers,
+                timeout=timeout,
+                connector=connector,
+                cookie_jar=cookie_jar
+            ) as session:
+                # Небольшая задержка перед запросом (имитация человеческого поведения)
+                await asyncio.sleep(1 + attempt * 0.5)
+                
+                # Делаем запрос с поддержкой редиректов
+                async with session.get(
+                    url, 
+                    allow_redirects=True,
+                    ssl=False  # Некоторые сайты требуют отключения проверки SSL
+                ) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        # Проверяем, не получили ли мы страницу с защитой от ботов
+                        content_lower = content.lower()
+                        if any(indicator in content_lower for indicator in [
+                            'cloudflare', 'checking your browser', 'ddos protection',
+                            'please wait', 'just a moment', 'captcha', 'recaptcha'
+                        ]):
+                            logger.warning(f"Обнаружена защита от ботов на {url}, пробуем другой User-Agent...")
+                            if attempt < len(user_agents):
+                                continue  # Пробуем следующий User-Agent
+                            else:
+                                logger.error(f"Не удалось обойти защиту от ботов для {url}")
+                                return None
+                        return content
+                    elif response.status == 403:
+                        logger.warning(f"Доступ запрещен (403) для {url}, пробуем другой User-Agent...")
+                        if attempt < len(user_agents):
+                            continue  # Пробуем следующий User-Agent
+                        else:
+                            logger.error(f"Доступ запрещен (403) для {url} после всех попыток.")
+                            return None
+                    elif response.status == 429:
+                        # Слишком много запросов - ждем дольше
+                        logger.warning(f"Слишком много запросов (429) для {url}, ждем...")
+                        await asyncio.sleep(5)
+                        if attempt < len(user_agents):
+                            continue
+                        return None
+                    else:
+                        logger.error(f"Ошибка при получении страницы {url}: статус {response.status}")
+                        if attempt < len(user_agents):
+                            continue
+                        return None
+        except aiohttp.ClientError as e:
+            logger.warning(f"Ошибка сети при запросе страницы {url} (попытка {attempt}): {e}")
+            if attempt < len(user_agents):
+                await asyncio.sleep(2)  # Ждем перед следующей попыткой
+                continue
+            return None
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при запросе страницы {url} (попытка {attempt}): {e}")
+            if attempt < len(user_agents):
+                await asyncio.sleep(2)
+                continue
+            return None
+    
+    return None
 
 
 def calculate_hash(content: str) -> str:
