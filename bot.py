@@ -763,7 +763,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url=text,
         name=project_name,
         interval_minutes=60,
-        is_active=True
+        is_active=True,
+        notify_on_no_changes=False  # По умолчанию выключено, можно включить в настройках
     )
     
     user_projects[chat_id][project_id] = project
