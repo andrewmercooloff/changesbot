@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
 from urllib.parse import urlparse
@@ -302,13 +302,32 @@ def format_interval(minutes: int) -> str:
         return f"{days} дн"
 
 
+def get_local_time() -> datetime:
+    """Возвращает текущее время в часовом поясе UTC+3 (Москва/Минск)"""
+    return datetime.now(MOSCOW_TZ)
+
+
+def format_local_time(dt: Optional[datetime] = None) -> str:
+    """Форматирует время в локальном часовом поясе"""
+    if dt is None:
+        dt = get_local_time()
+    elif dt.tzinfo is None:
+        # Если время без часового пояса, считаем что это UTC и конвертируем
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(MOSCOW_TZ)
+    else:
+        dt = dt.astimezone(MOSCOW_TZ)
+    return dt.strftime('%d.%m.%Y в %H:%M:%S')
+
+
 async def check_page_changes(chat_id: int, project: Project, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет изменения на странице и отправляет уведомление при изменении"""
+    logger.info(f"Начинаю проверку проекта {project.project_id} ({project.name}) для пользователя {chat_id}")
+    current_time = get_local_time()
     content = await fetch_page_content(project.url)
     
     if content is None:
         # Обновляем время последней проверки даже при ошибке
-        project.last_check = datetime.now().isoformat()
+        project.last_check = current_time.isoformat()
         user_projects[chat_id][project.project_id] = project
         
         error_message = (
@@ -326,12 +345,14 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
         return
     
     current_hash = calculate_hash(content)
+    logger.info(f"Хеш страницы для проекта {project.project_id}: {current_hash[:16]}... (предыдущий: {project.last_hash[:16] if project.last_hash else 'нет'}...)")
     
     if project.last_hash is None:
         # Первая проверка - сохраняем хеш
         project.last_hash = current_hash
-        project.last_check = datetime.now().isoformat()
+        project.last_check = current_time.isoformat()
         user_projects[chat_id][project.project_id] = project
+        logger.info(f"Первая проверка завершена для проекта {project.project_id}, хеш сохранен")
         
         await context.bot.send_message(
             chat_id=chat_id,
@@ -347,8 +368,9 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
         )
     elif current_hash != project.last_hash:
         # Страница изменилась!
+        logger.warning(f"ОБНАРУЖЕНЫ ИЗМЕНЕНИЯ! Проект {project.project_id}: старый хеш {project.last_hash[:16]}..., новый {current_hash[:16]}...")
         project.last_hash = current_hash
-        project.last_check = datetime.now().isoformat()
+        project.last_check = current_time.isoformat()
         user_projects[chat_id][project.project_id] = project
         
         await context.bot.send_message(
@@ -357,21 +379,22 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
                 f"🔔 ВНИМАНИЕ! Обнаружены изменения!\n\n"
                 f"📌 Проект: {project.name}\n"
                 f"🔗 Страница: {project.url}\n\n"
-                f"⏰ Время обнаружения: {datetime.now().strftime('%d.%m.%Y в %H:%M:%S')}\n\n"
+                f"⏰ Время обнаружения: {format_local_time(current_time)}\n\n"
                 f"📝 Страница была изменена. Проверьте её содержимое!"
             )
         )
-        logger.info(f"Изменения обнаружены для проекта {project.project_id} пользователя {chat_id}")
+        logger.info(f"Уведомление об изменениях отправлено для проекта {project.project_id} пользователя {chat_id}")
     else:
         # Изменений нет
-        project.last_check = datetime.now().isoformat()
+        project.last_check = current_time.isoformat()
         user_projects[chat_id][project.project_id] = project
-        logger.debug(f"Изменений не обнаружено для проекта {project.project_id}")
+        logger.info(f"Изменений не обнаружено для проекта {project.project_id}, следующая проверка через {format_interval(project.interval_minutes)}")
 
 
 async def monitoring_loop(chat_id: int, project: Project, context: ContextTypes.DEFAULT_TYPE):
     """Основной цикл мониторинга страницы"""
     task_key = (chat_id, project.project_id)
+    logger.info(f"Запущен цикл мониторинга для проекта {project.project_id} пользователя {chat_id}, интервал: {project.interval_minutes} минут")
     
     while (chat_id in user_projects and 
            project.project_id in user_projects[chat_id] and 
@@ -379,10 +402,17 @@ async def monitoring_loop(chat_id: int, project: Project, context: ContextTypes.
         try:
             # Получаем актуальную версию проекта (на случай изменения настроек)
             current_project = user_projects[chat_id][project.project_id]
+            interval_seconds = current_project.interval_minutes * 60
+            
+            # Выполняем проверку
             await check_page_changes(chat_id, current_project, context)
             
+            # Логируем время следующей проверки
+            next_check_time = get_local_time() + timedelta(seconds=interval_seconds)
+            logger.info(f"Проверка завершена для проекта {current_project.project_id}, следующая проверка в {format_local_time(next_check_time)}")
+            
             # Ждем указанный интервал
-            await asyncio.sleep(current_project.interval_minutes * 60)
+            await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
             logger.info(f"Мониторинг остановлен для проекта {project.project_id} пользователя {chat_id}")
             break
@@ -449,7 +479,7 @@ async def show_projects_menu(update: Update, context: Optional[ContextTypes.DEFA
         if project.last_check:
             try:
                 check_time = datetime.fromisoformat(project.last_check)
-                last_check = check_time.strftime('%d.%m %H:%M')
+                last_check = format_local_time(check_time)
             except:
                 pass
         
@@ -523,7 +553,7 @@ async def show_project_details(chat_id: int, project_id: str, query):
     if project.last_check:
         try:
             check_time = datetime.fromisoformat(project.last_check)
-            last_check = check_time.strftime('%d.%m.%Y в %H:%M:%S')
+            last_check = format_local_time(check_time)
         except:
             pass
     
@@ -816,7 +846,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if project.last_check:
             try:
                 check_time = datetime.fromisoformat(project.last_check)
-                last_check = check_time.strftime('%d.%m.%Y в %H:%M:%S')
+                last_check = format_local_time(check_time)
             except:
                 pass
         
