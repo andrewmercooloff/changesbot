@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 # Загружаем переменные окружения
 load_dotenv()
 
+# Часовой пояс (UTC+3 для Москвы/Минска)
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
