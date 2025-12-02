@@ -7,7 +7,9 @@ from datetime import datetime
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 import aiohttp
+import cloudscraper
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -48,10 +50,56 @@ user_projects: Dict[int, Dict[str, Project]] = {}
 # Ключ - (chat_id, project_id), значение - задача мониторинга
 monitoring_tasks: Dict[tuple, asyncio.Task] = {}
 
+# Executor для синхронных операций (cloudscraper)
+executor = ThreadPoolExecutor(max_workers=5)
+
+
+def _fetch_with_cloudscraper(url: str) -> Optional[str]:
+    """Синхронная функция для получения страницы через cloudscraper (обход Cloudflare)"""
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            },
+            delay=10  # Задержка для Cloudflare challenge
+        )
+        response = scraper.get(url, timeout=30)
+        if response.status_code == 200:
+            return response.text
+        else:
+            logger.error(f"Cloudscraper вернул статус {response.status_code} для {url}")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка cloudscraper для {url}: {e}")
+        return None
+
 
 async def fetch_page_content(url: str) -> Optional[str]:
     """Получает содержимое страницы по URL с заголовками браузера для обхода защиты от ботов"""
-    # Пробуем несколько вариантов заголовков для лучшего обхода защиты
+    # Сначала пробуем через cloudscraper (для Cloudflare)
+    try:
+        content = await asyncio.get_event_loop().run_in_executor(
+            executor, 
+            _fetch_with_cloudscraper, 
+            url
+        )
+        if content:
+            # Проверяем, не получили ли мы страницу с защитой от ботов
+            content_lower = content.lower()
+            if any(indicator in content_lower for indicator in [
+                'checking your browser', 'ddos protection',
+                'please wait', 'just a moment', 'captcha', 'recaptcha'
+            ]):
+                logger.warning(f"Cloudflare challenge обнаружен на {url}, пробуем обычный метод...")
+            else:
+                logger.info(f"Успешно получен контент через cloudscraper для {url}")
+                return content
+    except Exception as e:
+        logger.warning(f"Ошибка при использовании cloudscraper для {url}: {e}, пробуем обычный метод...")
+    
+    # Если cloudscraper не помог, пробуем обычный метод с несколькими вариантами заголовков
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
