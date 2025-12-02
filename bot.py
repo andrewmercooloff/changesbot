@@ -27,16 +27,50 @@ monitoring_tasks: Dict[int, asyncio.Task] = {}
 
 
 async def fetch_page_content(url: str) -> Optional[str]:
-    """Получает содержимое страницы по URL"""
+    """Получает содержимое страницы по URL с заголовками браузера для обхода защиты от ботов"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        # Заголовки реального браузера для обхода защиты от ботов
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        }
+        
+        # Создаем сессию с заголовками и поддержкой cookies
+        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+        
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+            connector=connector,
+            cookie_jar=aiohttp.CookieJar()
+        ) as session:
+            # Небольшая задержка перед запросом (имитация человеческого поведения)
+            await asyncio.sleep(1)
+            
+            async with session.get(url, allow_redirects=True) as response:
                 if response.status == 200:
                     content = await response.text()
                     return content
+                elif response.status == 403:
+                    logger.error(f"Доступ запрещен (403) для {url}. Возможно, требуется более сложный обход защиты.")
+                    return None
                 else:
                     logger.error(f"Ошибка при получении страницы: статус {response.status}")
                     return None
+    except aiohttp.ClientError as e:
+        logger.error(f"Ошибка сети при запросе страницы {url}: {e}")
+        return None
     except Exception as e:
         logger.error(f"Ошибка при запросе страницы {url}: {e}")
         return None
@@ -52,19 +86,21 @@ async def check_page_changes(chat_id: int, url: str, context: ContextTypes.DEFAU
     content = await fetch_page_content(url)
     
     if content is None:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ Проблема при проверке страницы\n\n"
-                f"🔗 Страница: {url}\n\n"
-                f"❌ Не удалось получить содержимое страницы.\n"
-                f"Возможные причины:\n"
-                f"• Страница временно недоступна\n"
-                f"• Проблемы с интернет-соединением\n"
-                f"• Страница требует авторизации\n\n"
-                f"🔄 Я попробую снова при следующей проверке (через 1 час)"
-            )
+        # Проверяем, не является ли это проблемой с защитой от ботов
+        error_message = (
+            f"⚠️ Проблема при проверке страницы\n\n"
+            f"🔗 Страница: {url}\n\n"
+            f"❌ Не удалось получить содержимое страницы.\n"
+            f"Возможные причины:\n"
+            f"• Страница использует защиту от ботов (Cloudflare, reCAPTCHA и т.д.)\n"
+            f"• Страница временно недоступна\n"
+            f"• Проблемы с интернет-соединением\n"
+            f"• Страница требует авторизации\n\n"
+            f"💡 Бот использует заголовки браузера для обхода защиты,\n"
+            f"но некоторые сайты требуют более сложных методов.\n\n"
+            f"🔄 Я попробую снова при следующей проверке (через 1 час)"
         )
+        await context.bot.send_message(chat_id=chat_id, text=error_message)
         return
     
     current_hash = calculate_hash(content)
