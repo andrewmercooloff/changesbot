@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import cloudscraper
