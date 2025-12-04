@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import logging
 import uuid
+import random
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
@@ -13,6 +15,13 @@ import cloudscraper
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
+
+# Пробуем импортировать curl_cffi, если доступен
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -26,6 +35,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Логируем доступность curl_cffi
+if not CURL_CFFI_AVAILABLE:
+    logger.warning("curl_cffi не установлен, будет использован только cloudscraper. Для лучшего обхода Cloudflare установите: pip install curl-cffi")
 
 
 @dataclass
@@ -59,66 +72,139 @@ monitoring_tasks: Dict[tuple, asyncio.Task] = {}
 executor = ThreadPoolExecutor(max_workers=5)
 
 
+def _fetch_with_curl_cffi(url: str) -> Optional[str]:
+    """Попытка обхода Cloudflare через curl_cffi (более эффективный метод)"""
+    if not CURL_CFFI_AVAILABLE:
+        return None
+    
+    try:
+        logger.info(f"Попытка обхода Cloudflare через curl_cffi для {url}")
+        
+        # Эмулируем реального пользователя из Беларуси
+        # Случайная задержка перед запросом (имитация чтения страницы)
+        time.sleep(random.uniform(2, 5))
+        
+        # Используем реалистичный браузер Chrome на Windows (популярный в Беларуси)
+        response = curl_requests.get(
+            url,
+            impersonate="chrome120",  # Эмулируем Chrome 120
+            timeout=60,
+            allow_redirects=True,
+            headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'ru-BY,ru;q=0.9,be;q=0.8,en-US;q=0.7,en;q=0.6',  # Беларусь
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+            }
+        )
+        
+        logger.info(f"curl_cffi получил ответ со статусом {response.status_code} для {url}")
+        
+        if response.status_code == 200:
+            content = response.text
+            if content and len(content) > 100:
+                content_lower = content.lower()
+                if not any(indicator in content_lower for indicator in [
+                    'checking your browser', 'ddos protection',
+                    'please wait', 'just a moment', 'captcha', 'recaptcha',
+                    'cloudflare', 'cf-browser-verification'
+                ]):
+                    logger.info(f"✅ Успешно получен контент через curl_cffi для {url}")
+                    return content
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Ошибка curl_cffi для {url}: {e}")
+        return None
+
+
 def _fetch_with_cloudscraper(url: str) -> Optional[str]:
     """Синхронная функция для получения страницы через cloudscraper (обход Cloudflare)"""
     try:
         logger.info(f"Попытка обхода Cloudflare через cloudscraper для {url}")
-        # Пробуем разные настройки cloudscraper
-        browser_configs = [
-            {'browser': 'chrome', 'platform': 'windows', 'desktop': True},
-            {'browser': 'firefox', 'platform': 'windows', 'desktop': True},
-            {'browser': 'chrome', 'platform': 'darwin', 'desktop': True},
-        ]
         
-        for browser_config in browser_configs:
-            try:
-                scraper = cloudscraper.create_scraper(
-                    browser=browser_config,
-                    delay=15,  # Увеличиваем задержку для Cloudflare challenge
-                    debug=False
-                )
-                # Добавляем дополнительные заголовки
-                scraper.headers.update({
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                })
-                
-                response = scraper.get(url, timeout=45, allow_redirects=True)
-                logger.info(f"Cloudscraper получил ответ со статусом {response.status_code} для {url}")
-                
-                if response.status_code == 200:
-                    content = response.text
-                    # Проверяем, что это не страница с challenge
-                    if content and len(content) > 100:  # Минимальный размер контента
-                        content_lower = content.lower()
-                        if not any(indicator in content_lower for indicator in [
-                            'checking your browser', 'ddos protection',
-                            'please wait', 'just a moment', 'captcha', 'recaptcha',
-                            'cloudflare', 'cf-browser-verification'
-                        ]):
-                            logger.info(f"Успешно получен контент через cloudscraper ({browser_config['browser']}) для {url}")
-                            return content
-                        else:
-                            logger.warning(f"Cloudflare challenge обнаружен в ответе для {url}, пробуем другой браузер...")
-                            continue
-                    else:
-                        logger.warning(f"Получен слишком короткий ответ для {url}, пробуем другой браузер...")
-                        continue
-                elif response.status_code == 403:
-                    logger.warning(f"Cloudscraper получил 403 для {url} с {browser_config['browser']}, пробуем другой браузер...")
-                    continue
-                else:
-                    logger.warning(f"Cloudscraper получил статус {response.status_code} для {url}, пробуем другой браузер...")
-                    continue
-            except Exception as browser_error:
-                logger.warning(f"Ошибка cloudscraper с {browser_config['browser']} для {url}: {browser_error}, пробуем следующий...")
-                continue
+        # Эмулируем реального пользователя из Беларуси
+        # Случайная задержка (имитация чтения страницы перед переходом)
+        time.sleep(random.uniform(1, 3))
         
-        logger.error(f"Cloudscraper не смог обойти защиту для {url} после всех попыток")
+        # Настройки для пользователя из Беларуси (Windows + Chrome - самый популярный)
+        browser_config = {
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+        
+        scraper = cloudscraper.create_scraper(
+            browser=browser_config,
+            delay=random.randint(10, 20),  # Случайная задержка для Cloudflare challenge
+            debug=False
+        )
+        
+        # Реалистичные заголовки для пользователя из Беларуси
+        scraper.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'ru-BY,ru;q=0.9,be;q=0.8,en-US;q=0.7,en;q=0.6',  # Беларусь
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+        })
+        
+        # Добавляем Referer (если можем определить домен)
+        try:
+            parsed = urlparse(url)
+            domain = f"{parsed.scheme}://{parsed.netloc}"
+            scraper.headers['Referer'] = domain
+        except:
+            pass
+        
+        # Имитация движения мыши - делаем несколько запросов перед основным
+        # (как будто пользователь кликает по ссылкам)
+        try:
+            # Сначала запрашиваем главную страницу (если это не главная)
+            if '/news' in url or len(url.split('/')) > 4:
+                main_url = f"{parsed.scheme}://{parsed.netloc}/"
+                time.sleep(random.uniform(0.5, 1.5))
+                scraper.get(main_url, timeout=30, allow_redirects=True)
+                time.sleep(random.uniform(1, 2))  # Имитация чтения
+        except:
+            pass  # Игнорируем ошибки предварительных запросов
+        
+        # Основной запрос
+        response = scraper.get(url, timeout=60, allow_redirects=True)
+        logger.info(f"Cloudscraper получил ответ со статусом {response.status_code} для {url}")
+        
+        if response.status_code == 200:
+            content = response.text
+            if content and len(content) > 100:
+                content_lower = content.lower()
+                if not any(indicator in content_lower for indicator in [
+                    'checking your browser', 'ddos protection',
+                    'please wait', 'just a moment', 'captcha', 'recaptcha',
+                    'cloudflare', 'cf-browser-verification'
+                ]):
+                    logger.info(f"✅ Успешно получен контент через cloudscraper для {url}")
+                    return content
+        
+        logger.warning(f"Cloudscraper не смог получить валидный контент для {url}")
         return None
     except Exception as e:
         logger.error(f"Критическая ошибка cloudscraper для {url}: {e}")
