@@ -53,6 +53,8 @@ class Project:
     is_active: bool = True
     notify_on_no_changes: bool = False  # Отправлять уведомления при отсутствии изменений
     last_notification: Optional[str] = None  # Время последнего уведомления
+    rss_url: Optional[str] = None  # URL RSS-ленты, если найдена
+    last_rss_items: Optional[List[str]] = None  # Список ID последних новостей из RSS
 
     def to_dict(self):
         return asdict(self)
@@ -208,6 +210,131 @@ def _fetch_with_cloudscraper(url: str) -> Optional[str]:
         return None
     except Exception as e:
         logger.error(f"Критическая ошибка cloudscraper для {url}: {e}")
+        return None
+
+
+async def find_rss_feed(base_url: str) -> Optional[str]:
+    """Ищет RSS-ленту для сайта (легальный способ получения новостей)"""
+    parsed = urlparse(base_url)
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    
+    # Стандартные пути для RSS-лент
+    rss_paths = [
+        '/feed',
+        '/rss',
+        '/rss.xml',
+        '/feed.xml',
+        '/news/feed',
+        '/news/rss',
+        '/blog/feed',
+        '/blog/rss',
+        '/atom.xml',
+        '/index.xml',
+    ]
+    
+    # Также пробуем добавить .rss или /feed к текущему пути
+    if '/news' in base_url:
+        rss_paths.insert(0, base_url.replace('/news', '/news/feed'))
+        rss_paths.insert(1, base_url.replace('/news', '/news/rss'))
+        rss_paths.insert(2, base_url + '/feed')
+        rss_paths.insert(3, base_url + '/rss')
+    
+    logger.info(f"Ищу RSS-ленту для {base_url}")
+    
+    for rss_path in rss_paths:
+        if rss_path.startswith('http'):
+            rss_url = rss_path
+        else:
+            rss_url = urljoin(domain, rss_path)
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '').lower()
+                        content = await response.text()
+                        
+                        # Проверяем, что это действительно RSS/Atom
+                        if ('xml' in content_type or 'rss' in content_type or 
+                            'atom' in content_type or 
+                            '<rss' in content.lower() or 
+                            '<feed' in content.lower() or
+                            '<?xml' in content[:100]):
+                            logger.info(f"✅ Найдена RSS-лента: {rss_url}")
+                            return rss_url
+        except Exception as e:
+            logger.debug(f"RSS не найден по пути {rss_url}: {e}")
+            continue
+    
+    # Пробуем найти ссылку на RSS в HTML страницы
+    try:
+        content = await fetch_page_content(base_url)
+        if content:
+            # Ищем ссылки на RSS в HTML
+            rss_patterns = [
+                r'<link[^>]*type=["\']application/rss\+xml["\'][^>]*href=["\']([^"\']+)["\']',
+                r'<link[^>]*type=["\']application/atom\+xml["\'][^>]*href=["\']([^"\']+)["\']',
+                r'<a[^>]*href=["\']([^"\']*feed[^"\']*)["\'][^>]*>',
+                r'<a[^>]*href=["\']([^"\']*rss[^"\']*)["\'][^>]*>',
+            ]
+            
+            for pattern in rss_patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                for match in matches:
+                    rss_url = urljoin(base_url, match)
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                if response.status == 200:
+                                    logger.info(f"✅ Найдена RSS-лента в HTML: {rss_url}")
+                                    return rss_url
+                    except:
+                        continue
+    except:
+        pass
+    
+    logger.info(f"RSS-лента не найдена для {base_url}")
+    return None
+
+
+async def fetch_rss_content(rss_url: str) -> Optional[Dict]:
+    """Получает и парсит RSS-ленту"""
+    try:
+        logger.info(f"Получаю RSS-ленту: {rss_url}")
+        
+        # Используем feedparser для парсинга RSS
+        def parse_rss(url: str):
+            return feedparser.parse(url)
+        
+        feed = await asyncio.get_event_loop().run_in_executor(executor, parse_rss, rss_url)
+        
+        if feed.bozo == 0 or len(feed.entries) > 0:  # bozo=0 означает успешный парсинг
+            # Формируем список новостей
+            items = []
+            for entry in feed.entries[:10]:  # Берем последние 10 новостей
+                item_id = entry.get('id', entry.get('link', ''))
+                title = entry.get('title', 'Без названия')
+                link = entry.get('link', '')
+                published = entry.get('published', entry.get('updated', ''))
+                
+                items.append({
+                    'id': item_id,
+                    'title': title,
+                    'link': link,
+                    'published': published
+                })
+            
+            logger.info(f"✅ Получено {len(items)} новостей из RSS")
+            return {
+                'items': items,
+                'feed_title': feed.feed.get('title', 'RSS Feed'),
+                'feed_link': feed.feed.get('link', rss_url)
+            }
+        else:
+            logger.warning(f"RSS-лента невалидна или пуста: {rss_url}")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении RSS: {e}")
         return None
 
 
@@ -414,6 +541,113 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
     """Проверяет изменения на странице и отправляет уведомление при изменении"""
     logger.info(f"Начинаю проверку проекта {project.project_id} ({project.name}) для пользователя {chat_id}")
     current_time = get_local_time()
+    
+    # Сначала пробуем RSS (легальный способ для новостей)
+    rss_data = None
+    if project.rss_url:
+        # Используем уже найденную RSS-ленту
+        rss_data = await fetch_rss_content(project.rss_url)
+    else:
+        # Пытаемся найти RSS-ленту
+        rss_url = await find_rss_feed(project.url)
+        if rss_url:
+            project.rss_url = rss_url
+            user_projects[chat_id][project.project_id] = project
+            rss_data = await fetch_rss_content(rss_url)
+    
+    # Если RSS найден и работает - используем его
+    if rss_data and rss_data.get('items'):
+        items = rss_data['items']
+        current_item_ids = [item['id'] for item in items]
+        
+        if project.last_rss_items is None:
+            # Первая проверка - сохраняем список новостей
+            project.last_rss_items = current_item_ids
+            project.last_check = current_time.isoformat()
+            user_projects[chat_id][project.project_id] = project
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ Отслеживание через RSS успешно начато!\n\n"
+                    f"📌 Проект: {project.name}\n"
+                    f"🔗 RSS-лента: {project.rss_url}\n"
+                    f"📰 Найдено новостей: {len(items)}\n\n"
+                    f"⏰ Периодичность проверки: {format_interval(project.interval_minutes)}\n"
+                    f"🔔 Я отправлю уведомление при появлении новых новостей"
+                )
+            )
+            logger.info(f"RSS отслеживание начато для проекта {project.project_id}")
+            return
+        
+        # Проверяем новые новости
+        new_items = []
+        for item in items:
+            if item['id'] not in project.last_rss_items:
+                new_items.append(item)
+        
+        if new_items:
+            # Есть новые новости!
+            project.last_rss_items = current_item_ids
+            project.last_check = current_time.isoformat()
+            user_projects[chat_id][project.project_id] = project
+            
+            for new_item in reversed(new_items):  # От старых к новым
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"📰 НОВАЯ НОВОСТЬ!\n\n"
+                        f"📌 Проект: {project.name}\n\n"
+                        f"📝 {new_item['title']}\n\n"
+                        f"🔗 {new_item['link']}\n\n"
+                        f"⏰ Время обнаружения: {format_local_time(current_time)}"
+                    )
+                )
+            
+            logger.info(f"Обнаружено {len(new_items)} новых новостей для проекта {project.project_id}")
+        else:
+            # Новых новостей нет
+            project.last_check = current_time.isoformat()
+            user_projects[chat_id][project.project_id] = project
+            
+            # Отправляем уведомление, если включено
+            should_notify = False
+            if project.notify_on_no_changes:
+                if project.last_notification:
+                    try:
+                        last_notif_time = datetime.fromisoformat(project.last_notification)
+                        if last_notif_time.tzinfo is None:
+                            last_notif_time = last_notif_time.replace(tzinfo=timezone.utc).astimezone(MOSCOW_TZ)
+                        else:
+                            last_notif_time = last_notif_time.astimezone(MOSCOW_TZ)
+                        time_since_last = (current_time - last_notif_time).total_seconds()
+                        if time_since_last >= 3600:
+                            should_notify = True
+                    except:
+                        should_notify = True
+                else:
+                    should_notify = True
+            
+            if should_notify:
+                project.last_notification = current_time.isoformat()
+                user_projects[chat_id][project.project_id] = project
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ Проверка RSS выполнена\n\n"
+                        f"📌 Проект: {project.name}\n"
+                        f"🔗 RSS-лента: {project.rss_url}\n\n"
+                        f"⏰ Время проверки: {format_local_time(current_time)}\n"
+                        f"📊 Новых новостей: нет\n\n"
+                        f"🔄 Следующая проверка через {format_interval(project.interval_minutes)}"
+                    )
+                )
+            
+            logger.info(f"Новых новостей не обнаружено для проекта {project.project_id}")
+        
+        return
+    
+    # Если RSS не найден или не работает - используем обычный метод
     content = await fetch_page_content(project.url)
     
     if content is None:
@@ -850,7 +1084,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=project_name,
         interval_minutes=60,
         is_active=True,
-        notify_on_no_changes=False  # По умолчанию выключено, можно включить в настройках
+        notify_on_no_changes=False,  # По умолчанию выключено, можно включить в настройках
+        rss_url=None,  # Будет найдена автоматически при первой проверке
+        last_rss_items=None
     )
     
     user_projects[chat_id][project_id] = project
