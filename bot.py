@@ -5,6 +5,7 @@ import logging
 import uuid
 import random
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
@@ -12,6 +13,7 @@ from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import cloudscraper
+import feedparser
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -22,6 +24,13 @@ try:
     CURL_CFFI_AVAILABLE = True
 except ImportError:
     CURL_CFFI_AVAILABLE = False
+
+# Пробуем импортировать playwright для обхода Cloudflare
+try:
+    from playwright.async_api import async_playwright, Browser, Page
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -36,9 +45,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Логируем доступность curl_cffi
+# Логируем доступность curl_cffi и playwright
 if not CURL_CFFI_AVAILABLE:
     logger.warning("curl_cffi не установлен, будет использован только cloudscraper. Для лучшего обхода Cloudflare установите: pip install curl-cffi")
+
+# Глобальные переменные для Playwright (ленивая инициализация)
+_playwright_browser: Optional[Browser] = None
+_playwright_lock = asyncio.Lock()
+
+if not PLAYWRIGHT_AVAILABLE:
+    logger.warning("playwright не установлен. Для решения Cloudflare капчи установите: pip install playwright && playwright install chromium")
 
 
 @dataclass
@@ -247,12 +263,12 @@ async def find_rss_feed(base_url: str) -> Optional[str]:
         else:
             rss_url = urljoin(domain, rss_path)
         
-        try:
-            async with aiohttp.ClientSession() as session:
+    try:
+        async with aiohttp.ClientSession() as session:
                 async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
+                if response.status == 200:
                         content_type = response.headers.get('Content-Type', '').lower()
-                        content = await response.text()
+                    content = await response.text()
                         
                         # Проверяем, что это действительно RSS/Atom
                         if ('xml' in content_type or 'rss' in content_type or 
@@ -295,6 +311,156 @@ async def find_rss_feed(base_url: str) -> Optional[str]:
     
     logger.info(f"RSS-лента не найдена для {base_url}")
     return None
+
+
+async def _get_playwright_browser() -> Optional[Browser]:
+    """Получает или создает глобальный браузер Playwright"""
+    global _playwright_browser, _playwright_lock
+    
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+    
+    async with _playwright_lock:
+        if _playwright_browser is None:
+            try:
+                playwright = await async_playwright().start()
+                # Используем Chromium с настройками для обхода Cloudflare
+                _playwright_browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                    ]
+                )
+                logger.info("✅ Playwright браузер инициализирован")
+            except Exception as e:
+                logger.error(f"Ошибка инициализации Playwright: {e}")
+                return None
+        
+        return _playwright_browser
+
+
+async def _fetch_with_playwright(url: str) -> Optional[str]:
+    """Получает содержимое страницы через Playwright (решает Cloudflare капчу)"""
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+    
+    try:
+        logger.info(f"🌐 Пробую получить контент через Playwright для {url}")
+        
+        browser = await _get_playwright_browser()
+        if not browser:
+            return None
+        
+        # Создаем новый контекст браузера с настройками для обхода Cloudflare
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='ru-BY',  # Беларусь
+            timezone_id='Europe/Minsk',
+            permissions=['geolocation'],
+            geolocation={'latitude': 53.9045, 'longitude': 27.5615},  # Координаты Минска
+            extra_http_headers={
+                'Accept-Language': 'ru-BY,ru;q=0.9,be;q=0.8,en-US;q=0.7,en;q=0.6',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            }
+        )
+        
+        # Добавляем скрипты для обхода детекции ботов
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['ru-BY', 'ru', 'be', 'en-US', 'en']
+            });
+            
+            window.chrome = {
+                runtime: {}
+            };
+        """)
+        
+        page = await context.new_page()
+        
+        # Имитация человеческого поведения
+        await page.set_extra_http_headers({
+            'Referer': urlparse(url).scheme + '://' + urlparse(url).netloc + '/',
+        })
+        
+        # Переходим на страницу и ждем загрузки
+        try:
+            # Ждем до 60 секунд (Cloudflare может долго проверять)
+            await page.goto(url, wait_until='networkidle', timeout=60000)
+            
+            # Дополнительное ожидание для Cloudflare challenge
+            await asyncio.sleep(3)
+            
+            # Проверяем, не попали ли мы на страницу Cloudflare
+            page_content = await page.content()
+            content_lower = page_content.lower()
+            
+            if any(indicator in content_lower for indicator in [
+                'checking your browser', 'ddos protection',
+                'please wait', 'just a moment', 'captcha', 'recaptcha',
+                'cloudflare', 'cf-browser-verification'
+            ]):
+                logger.info("⏳ Обнаружен Cloudflare challenge, жду решения...")
+                # Ждем еще дольше, чтобы Cloudflare успел проверить
+                await asyncio.sleep(10)
+                
+                # Проверяем снова
+                await page.reload(wait_until='networkidle', timeout=60000)
+                await asyncio.sleep(5)
+                page_content = await page.content()
+                content_lower = page_content.lower()
+                
+                if any(indicator in content_lower for indicator in [
+                    'checking your browser', 'ddos protection',
+                    'please wait', 'just a moment', 'captcha', 'recaptcha'
+                ]):
+                    logger.warning("❌ Cloudflare challenge не решен через Playwright")
+                    await context.close()
+                    return None
+            
+            # Имитация человеческого поведения - скроллим страницу
+            await page.evaluate("""
+                window.scrollTo(0, document.body.scrollHeight / 3);
+            """)
+            await asyncio.sleep(1)
+            await page.evaluate("""
+                window.scrollTo(0, document.body.scrollHeight / 2);
+            """)
+            await asyncio.sleep(1)
+            
+            # Получаем финальный HTML
+            content = await page.content()
+            
+            if content and len(content) > 100:
+                logger.info(f"✅ Успешно получен контент через Playwright для {url} ({len(content)} символов)")
+                await context.close()
+                    return content
+                else:
+                logger.warning(f"Playwright получил пустой контент для {url}")
+                await context.close()
+                    return None
+                
+        except Exception as page_error:
+            logger.error(f"Ошибка при загрузке страницы через Playwright: {page_error}")
+            await context.close()
+            return None
+            
+    except Exception as e:
+        logger.error(f"Критическая ошибка Playwright для {url}: {e}")
+        return None
 
 
 async def fetch_rss_content(rss_url: str) -> Optional[Dict]:
@@ -354,7 +520,7 @@ async def fetch_page_content(url: str) -> Optional[str]:
                 'checking your browser', 'ddos protection',
                 'please wait', 'just a moment', 'captcha', 'recaptcha'
             ]):
-                logger.warning(f"Cloudflare challenge обнаружен на {url}, пробуем обычный метод...")
+                logger.warning(f"Cloudflare challenge обнаружен на {url}, пробуем Playwright...")
             else:
                 logger.info(f"Успешно получен контент через cloudscraper для {url}")
                 return content
@@ -461,20 +627,30 @@ async def fetch_page_content(url: str) -> Optional[str]:
                             'cloudflare', 'checking your browser', 'ddos protection',
                             'please wait', 'just a moment', 'captcha', 'recaptcha'
                         ]):
-                            logger.warning(f"Обнаружена защита от ботов на {url}, пробуем другой User-Agent...")
+                            logger.warning(f"Обнаружена защита от ботов на {url}, пробуем Playwright...")
+                            # Если все методы не помогли, пробуем Playwright (последний шанс)
+                            if attempt >= len(user_agents):
+                                logger.info(f"Все методы не помогли, пробуем Playwright для {url}")
+                                playwright_content = await _fetch_with_playwright(url)
+                                if playwright_content:
+                                    return playwright_content
+                                logger.error(f"Не удалось обойти защиту от ботов для {url} даже через Playwright")
+                                return None
                             if attempt < len(user_agents):
                                 continue  # Пробуем следующий User-Agent
-                            else:
-                                logger.error(f"Не удалось обойти защиту от ботов для {url}")
-                                return None
                         return content
                     elif response.status == 403:
-                        logger.warning(f"Доступ запрещен (403) для {url}, пробуем другой User-Agent...")
+                        logger.warning(f"Доступ запрещен (403) для {url}, пробуем Playwright...")
+                        if attempt >= len(user_agents):
+                            # Если все User-Agent не помогли, пробуем Playwright
+                            logger.info(f"Все User-Agent не помогли, пробуем Playwright для {url}")
+                            playwright_content = await _fetch_with_playwright(url)
+                            if playwright_content:
+                                return playwright_content
+                            logger.error(f"Доступ запрещен (403) для {url} после всех попыток, включая Playwright.")
+                            return None
                         if attempt < len(user_agents):
                             continue  # Пробуем следующий User-Agent
-                        else:
-                            logger.error(f"Доступ запрещен (403) для {url} после всех попыток.")
-                            return None
                     elif response.status == 429:
                         # Слишком много запросов - ждем дольше
                         logger.warning(f"Слишком много запросов (429) для {url}, ждем...")
@@ -500,6 +676,14 @@ async def fetch_page_content(url: str) -> Optional[str]:
                 continue
             return None
     
+    # Если все методы не помогли, пробуем Playwright как последний шанс
+    if PLAYWRIGHT_AVAILABLE:
+        logger.info(f"Все стандартные методы не помогли, пробуем Playwright для {url}")
+        playwright_content = await _fetch_with_playwright(url)
+        if playwright_content:
+            return playwright_content
+    
+    logger.error(f"Не удалось получить контент для {url} всеми доступными методами")
     return None
 
 
@@ -566,9 +750,9 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
             project.last_check = current_time.isoformat()
             user_projects[chat_id][project.project_id] = project
             
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
                     f"✅ Отслеживание через RSS успешно начато!\n\n"
                     f"📌 Проект: {project.name}\n"
                     f"🔗 RSS-лента: {project.rss_url}\n"
@@ -659,13 +843,13 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
             f"⚠️ Проблема при проверке проекта\n\n"
             f"📌 Проект: {project.name}\n"
             f"🔗 Страница: {project.url}\n\n"
-            f"❌ Не удалось получить содержимое страницы.\n"
-            f"Возможные причины:\n"
+                f"❌ Не удалось получить содержимое страницы.\n"
+                f"Возможные причины:\n"
             f"• Страница использует защиту от ботов (Cloudflare, reCAPTCHA и т.д.)\n"
-            f"• Страница временно недоступна\n"
+                f"• Страница временно недоступна\n"
             f"• Проблемы с интернет-соединением\n\n"
             f"🔄 Следующая проверка через {format_interval(project.interval_minutes)}"
-        )
+            )
         await context.bot.send_message(chat_id=chat_id, text=error_message)
         return
     
@@ -1155,8 +1339,8 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Удаляем проект
         del user_projects[chat_id][project_id]
-        
-        await update.message.reply_text(
+    
+    await update.message.reply_text(
             f"✅ Проект '{project.name}' удалён.\n\n"
             f"🔗 URL: {project.url}"
         )
@@ -1240,7 +1424,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 check_time = datetime.fromisoformat(project.last_check)
                 last_check = format_local_time(check_time)
-            except:
+        except:
                 pass
         
         status_text = "✅ Активен" if project.is_active else "⏸ Остановлен"
