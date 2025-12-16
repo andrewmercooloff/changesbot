@@ -466,9 +466,9 @@ async def fetch_page_content(url: str) -> Optional[str]:
                     allow_redirects=True,
                     ssl=False  # Некоторые сайты требуют отключения проверки SSL
                 ) as response:
-                    if response.status == 200:
+                if response.status == 200:
                         try:
-                            content = await response.text()
+                    content = await response.text()
                         except Exception as decode_error:
                             # Если ошибка декодирования (например, Brotli не установлен)
                             if 'brotli' in str(decode_error).lower() or 'br' in str(decode_error).lower():
@@ -510,7 +510,7 @@ async def fetch_page_content(url: str) -> Optional[str]:
                                 return None
                             if attempt < len(user_agents):
                                 continue  # Пробуем следующий User-Agent
-                        return content
+                    return content
                     elif response.status == 403:
                         logger.warning(f"Доступ запрещен (403) для {url}, пробуем Playwright...")
                         if attempt >= len(user_agents):
@@ -530,7 +530,7 @@ async def fetch_page_content(url: str) -> Optional[str]:
                         if attempt < len(user_agents):
                             continue
                         return None
-                    else:
+                else:
                         logger.error(f"Ошибка при получении страницы {url}: статус {response.status}")
                         if attempt < len(user_agents):
                             continue
@@ -540,13 +540,13 @@ async def fetch_page_content(url: str) -> Optional[str]:
             if attempt < len(user_agents):
                 await asyncio.sleep(2)  # Ждем перед следующей попыткой
                 continue
-            return None
+                    return None
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при запросе страницы {url} (попытка {attempt}): {e}")
-        if attempt < len(user_agents):
-            await asyncio.sleep(2)
-            continue
-        return None
+            logger.error(f"Неожиданная ошибка при запросе страницы {url} (попытка {attempt}): {e}")
+            if attempt < len(user_agents):
+                await asyncio.sleep(2)
+                continue
+            return None
     
     # Если все методы не помогли, пробуем Playwright как последний шанс
     if PLAYWRIGHT_AVAILABLE:
@@ -556,7 +556,7 @@ async def fetch_page_content(url: str) -> Optional[str]:
             return playwright_content
     
     logger.error(f"Не удалось получить контент для {url} всеми доступными методами")
-    return None
+        return None
 
 
 def calculate_hash(content: str) -> str:
