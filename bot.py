@@ -386,28 +386,24 @@ async def fetch_page_content(url: str) -> Optional[str]:
             url
         )
         if content:
-            # Проверяем, не получили ли мы страницу с защитой от ботов
             content_lower = content.lower()
             if any(indicator in content_lower for indicator in [
                 'checking your browser', 'ddos protection',
                 'please wait', 'just a moment', 'captcha', 'recaptcha'
             ]):
-                logger.warning(f"Cloudflare challenge обнаружен на {url}, пробуем Playwright...")
+                logger.warning(f"Cloudflare challenge обнаружен на {url}, пробуем другие методы...")
             else:
                 logger.info(f"Успешно получен контент через cloudscraper для {url}")
                 return content
     except Exception as e:
-        logger.warning(f"Ошибка при использовании cloudscraper для {url}: {e}, пробуем обычный метод...")
+        logger.warning(f"Ошибка cloudscraper для {url}: {e}")
     
-    # Если cloudscraper не помог, пробуем обычный метод с несколькими вариантами заголовков
+    # Пробуем обычный метод с aiohttp
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     ]
     
-    # Извлекаем домен для Referer
     try:
         parsed = urlparse(url)
         domain = f"{parsed.scheme}://{parsed.netloc}"
@@ -416,146 +412,67 @@ async def fetch_page_content(url: str) -> Optional[str]:
     
     for attempt, user_agent in enumerate(user_agents, 1):
         try:
-            # Заголовки реального браузера для обхода защиты от ботов
             headers = {
                 'User-Agent': user_agent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate',  # Убрали br, чтобы избежать ошибок, если brotli не установлен
+                'Accept-Encoding': 'gzip, deflate',
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
             }
             
-            # Добавляем Referer, если можем определить домен
             if domain:
                 headers['Referer'] = domain
             
-            # Создаем сессию с заголовками и поддержкой cookies
-            timeout = aiohttp.ClientTimeout(total=45, connect=10)
-            connector = aiohttp.TCPConnector(
-                limit=100, 
-                limit_per_host=30,
-                ttl_dns_cache=300,
-                force_close=False
-            )
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            connector = aiohttp.TCPConnector(limit=10, force_close=True)
             
-            # Создаем cookie jar для сохранения cookies между запросами
-            cookie_jar = aiohttp.CookieJar(unsafe=True)
-            
-            async with aiohttp.ClientSession(
-                headers=headers,
-                timeout=timeout,
-                connector=connector,
-                cookie_jar=cookie_jar
-            ) as session:
-                # Небольшая задержка перед запросом (имитация человеческого поведения)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout, connector=connector) as session:
                 await asyncio.sleep(1 + attempt * 0.5)
                 
-                # Делаем запрос с поддержкой редиректов
-                async with session.get(
-                    url, 
-                    allow_redirects=True,
-                    ssl=False  # Некоторые сайты требуют отключения проверки SSL
-                ) as response:
+                async with session.get(url, allow_redirects=True, ssl=False) as response:
                     if response.status == 200:
                         try:
                             content = await response.text()
                         except Exception as decode_error:
-                            # Если ошибка декодирования (например, Brotli не установлен)
-                            if 'brotli' in str(decode_error).lower() or 'br' in str(decode_error).lower():
-                                logger.warning(f"Ошибка декодирования Brotli для {url}, пробуем без br...")
-                                # Пробуем без brotli в заголовках
-                                headers_no_br = headers.copy()
-                                headers_no_br['Accept-Encoding'] = 'gzip, deflate'
-                                # Создаем новую сессию без br
-                                async with aiohttp.ClientSession(
-                                    headers=headers_no_br,
-                                    timeout=timeout,
-                                    connector=connector,
-                                    cookie_jar=cookie_jar
-                                ) as session2:
-                                    await asyncio.sleep(1)
-                                    async with session2.get(url, allow_redirects=True, ssl=False) as response2:
-                                        if response2.status == 200:
-                                            content = await response2.text()
-                                        else:
-                                            if attempt < len(user_agents):
-                                                continue
-                                            return None
-                            else:
-                                raise decode_error
-                        # Проверяем, не получили ли мы страницу с защитой от ботов
+                            logger.warning(f"Ошибка декодирования для {url}: {decode_error}")
+                            continue
+                        
                         content_lower = content.lower()
                         if any(indicator in content_lower for indicator in [
                             'cloudflare', 'checking your browser', 'ddos protection',
                             'please wait', 'just a moment', 'captcha', 'recaptcha'
                         ]):
-                            logger.warning(f"Обнаружена защита от ботов на {url}, пробуем Playwright...")
-                            # Если все методы не помогли, пробуем Playwright (последний шанс)
-                            if attempt >= len(user_agents):
-                                logger.info(f"Все методы не помогли, пробуем Playwright для {url}")
-                                playwright_content = await _fetch_with_playwright(url)
-                                if playwright_content:
-                                    return playwright_content
-                                logger.error(f"Не удалось обойти защиту от ботов для {url} даже через Playwright")
-                                return None
-                            if attempt < len(user_agents):
-                                continue  # Пробуем следующий User-Agent
+                            logger.warning(f"Защита от ботов на {url}")
+                            continue
                         return content
                     elif response.status == 403:
-                        logger.warning(f"Доступ запрещен (403) для {url}, пробуем Playwright...")
-                        if attempt >= len(user_agents):
-                            # Если все User-Agent не помогли, пробуем Playwright
-                            logger.info(f"Все User-Agent не помогли, пробуем Playwright для {url}")
-                            playwright_content = await _fetch_with_playwright(url)
-                            if playwright_content:
-                                return playwright_content
-                            logger.error(f"Доступ запрещен (403) для {url} после всех попыток, включая Playwright.")
-                            return None
-                        if attempt < len(user_agents):
-                            continue  # Пробуем следующий User-Agent
+                        logger.warning(f"Доступ запрещен (403) для {url}")
+                        continue
                     elif response.status == 429:
-                        # Слишком много запросов - ждем дольше
-                        logger.warning(f"Слишком много запросов (429) для {url}, ждем...")
+                        logger.warning(f"Слишком много запросов (429) для {url}")
                         await asyncio.sleep(5)
-                        if attempt < len(user_agents):
-                            continue
-                        return None
-                else:
-                        logger.error(f"Ошибка при получении страницы {url}: статус {response.status}")
-                        if attempt < len(user_agents):
-                            continue
-                        return None
+                        continue
+                    else:
+                        logger.error(f"Ошибка {response.status} для {url}")
+                        continue
         except aiohttp.ClientError as e:
-            logger.warning(f"Ошибка сети при запросе страницы {url} (попытка {attempt}): {e}")
-            if attempt < len(user_agents):
-                await asyncio.sleep(2)  # Ждем перед следующей попыткой
-                continue
-            return None
+            logger.warning(f"Ошибка сети для {url} (попытка {attempt}): {e}")
+            await asyncio.sleep(2)
+            continue
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при запросе страницы {url} (попытка {attempt}): {e}")
-            if attempt < len(user_agents):
-                await asyncio.sleep(2)
-                continue
-            return None
+            logger.error(f"Неожиданная ошибка для {url} (попытка {attempt}): {e}")
+            continue
     
-    # Если все методы не помогли, пробуем Playwright как последний шанс
+    # Если все методы не помогли, пробуем Playwright
     if PLAYWRIGHT_AVAILABLE:
-        logger.info(f"Все стандартные методы не помогли, пробуем Playwright для {url}")
+        logger.info(f"Пробуем Playwright для {url}")
         playwright_content = await _fetch_with_playwright(url)
         if playwright_content:
             return playwright_content
     
-    logger.error(f"Не удалось получить контент для {url} всеми доступными методами")
+    logger.error(f"Не удалось получить контент для {url}")
     return None
 
 
@@ -609,13 +526,13 @@ async def check_page_changes(chat_id: int, project: Project, context: ContextTyp
             f"⚠️ Проблема при проверке проекта\n\n"
             f"📌 Проект: {project.name}\n"
             f"🔗 Страница: {project.url}\n\n"
-                f"❌ Не удалось получить содержимое страницы.\n"
-                f"Возможные причины:\n"
+            f"❌ Не удалось получить содержимое страницы.\n"
+            f"Возможные причины:\n"
             f"• Страница использует защиту от ботов (Cloudflare, reCAPTCHA и т.д.)\n"
-                f"• Страница временно недоступна\n"
+            f"• Страница временно недоступна\n"
             f"• Проблемы с интернет-соединением\n\n"
             f"🔄 Следующая проверка через {format_interval(project.interval_minutes)}"
-            )
+        )
         await context.bot.send_message(chat_id=chat_id, text=error_message)
         return
     
@@ -1147,8 +1064,8 @@ async def interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         project_id, project = projects_list[project_num - 1]
         project.interval_minutes = minutes
         user_projects[chat_id][project_id] = project
-    
-    await update.message.reply_text(
+        
+        await update.message.reply_text(
             f"✅ Периодичность проверки для проекта '{project.name}' изменена на {format_interval(minutes)}."
         )
         
@@ -1188,7 +1105,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 check_time = datetime.fromisoformat(project.last_check)
                 last_check = format_local_time(check_time)
-        except:
+            except:
                 pass
         
         status_text = "✅ Активен" if project.is_active else "⏸ Остановлен"
